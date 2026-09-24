@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      # Used only by the migration-validation step below; the test suite
+      # itself uses a temporary SQLite database (see tests/conftest.py) and
+      # does not depend on this.
+      DATABASE_URL: sqlite+pysqlite:///${{ github.workspace }}/ci-migration-check.db
+      CORS_ORIGINS: http://localhost:5173
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Install dependencies
+        run: python -m pip install -e '.[dev]'
+
+      - name: ruff check
+        run: ruff check .
+
+      - name: ruff format --check
+        run: ruff format --check .
+
+      - name: pytest
+        run: pytest -q
+
+      - name: compileall
+        run: python -m compileall -q app migrations
+
+      - name: Validate migrations apply cleanly to a fresh database
+        run: alembic upgrade head
+
+      - name: Dependency audit
+        # Non-blocking for now: pip-audit occasionally flags advisories with
+        # no fix yet available. Failing the whole build on those isn't
+        # actionable, so this step is informational until that's revisited.
+        continue-on-error: true
+        run: |
+          python -m pip install pip-audit
+          python -m pip_audit

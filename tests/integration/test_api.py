@@ -66,6 +66,42 @@ def test_contact_field_length_limits(client, payload, field, length) -> None:
     assert response.json()["error"]["code"] == "validation_error"
 
 
+def test_idempotency_key_returns_same_contact_on_retry(client, payload) -> None:
+    headers = {"Idempotency-Key": "retry-key-1"}
+    first = client.post("/api/v1/contacts", json=payload, headers=headers)
+    second = client.post("/api/v1/contacts", json=payload, headers=headers)
+    assert first.status_code == 201
+    assert second.status_code == 201
+    assert first.json() == second.json()
+
+
+def test_idempotency_key_with_different_payload_still_returns_original(client, payload) -> None:
+    headers = {"Idempotency-Key": "retry-key-2"}
+    first = client.post("/api/v1/contacts", json=payload, headers=headers)
+    payload["message"] = "Uma mensagem completamente diferente."
+    second = client.post("/api/v1/contacts", json=payload, headers=headers)
+    assert first.json()["id"] == second.json()["id"]
+
+
+def test_missing_idempotency_key_creates_separate_contacts(client, payload) -> None:
+    first = client.post("/api/v1/contacts", json=payload)
+    second = client.post("/api/v1/contacts", json=payload)
+    assert first.json()["id"] != second.json()["id"]
+
+
+def test_different_idempotency_keys_create_separate_contacts(client, payload) -> None:
+    first = client.post("/api/v1/contacts", json=payload, headers={"Idempotency-Key": "key-a"})
+    second = client.post("/api/v1/contacts", json=payload, headers={"Idempotency-Key": "key-b"})
+    assert first.json()["id"] != second.json()["id"]
+
+
+def test_malformed_idempotency_key_returns_422(client, payload) -> None:
+    response = client.post(
+        "/api/v1/contacts", json=payload, headers={"Idempotency-Key": "has a space"}
+    )
+    assert response.status_code == 422
+
+
 def test_openapi_and_documentation(client) -> None:
     for path in ("/docs", "/redoc", "/openapi.json"):
         assert client.get(path).status_code == 200

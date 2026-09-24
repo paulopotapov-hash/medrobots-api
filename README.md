@@ -70,8 +70,19 @@ O `Dockerfile` usa build multi-stage (dependências instaladas numa stage `build
 
 - `GET /api/v1/health` → `200 {"status":"ok"}` (liveness). Não acede à base de dados; indica apenas que o processo responde. Usado pelo `HEALTHCHECK` do Docker.
 - `GET /api/v1/ready` → `200 {"status":"ok","database":"ok"}` (readiness) quando a base de dados responde a `SELECT 1`; `503` com o formato de erro comum quando a base de dados está indisponível.
-- `POST /api/v1/contacts` → `201` com `id`, `status` e `created_at`. Aceita `first_name`, `last_name`, `email`, `phone`, `address` e `message`. Nome, apelido, email e mensagem são obrigatórios. `phone` e `address` são opcionais. Campos desconhecidos, valores inválidos e texto vazio são rejeitados.
+- `POST /api/v1/contacts` → `201` com `id`, `status` e `created_at`. Aceita `first_name`, `last_name`, `email`, `phone`, `address` e `message`. Nome, apelido, email e mensagem são obrigatórios. `phone` e `address` são opcionais. Campos desconhecidos, valores inválidos e texto vazio são rejeitados. Aceita ainda um header opcional `Idempotency-Key` (ver secção "Idempotência" abaixo).
 - `/docs`, `/redoc` e `/openapi.json` mostram o contrato OpenAPI. Ficam acessíveis em development e test; uma futura fase pode decidir restringi-los em produção, o que ainda não foi implementado por falta de uma política concreta (autenticação, rede, etc.).
+
+### Idempotência
+
+O browser pode repetir um `POST /api/v1/contacts` por duplo clique, timeout do cliente ou retry de rede. Para tornar isso seguro sem construir um sistema de deduplicação complexo, o endpoint aceita um header opcional `Idempotency-Key` (1 a 255 carateres, `[A-Za-z0-9_-]`):
+
+- Sem o header: cada `POST` continua a criar um novo contacto (comportamento anterior, sem alterações).
+- Com o header: a primeira chamada com uma chave cria o contacto normalmente; qualquer chamada seguinte com a **mesma chave** devolve `201` com o **mesmo** `id`/`status`/`created_at` da primeira, em vez de duplicar. Chaves diferentes (ou pedidos sem chave) continuam a criar contactos separados.
+- A unicidade é garantida por uma constraint na base de dados (`idempotency_key` é único quando presente); duas chamadas em corrida com a mesma chave são resolvidas no `contact_service`, que apanha o conflito e devolve o contacto já persistido em vez de falhar.
+- Um `Idempotency-Key` mal formado devolve `422` com o mesmo formato de erro (`validation_error`) usado para o resto do corpo do pedido.
+
+O website deve gerar um valor único (ex.: UUID) por submissão do formulário e reenviá-lo em qualquer retry automático da mesma submissão.
 
 Todos os pedidos e respostas incluem o cabeçalho `X-Request-ID`: se o cliente enviar um valor válido (`[A-Za-z0-9_-]{1,64}`) este é devolvido tal e qual; caso contrário é gerado um novo UUID. O mesmo identificador aparece nos logs do pedido, o que facilita correlacionar um erro reportado pelo cliente com as linhas de log correspondentes.
 
@@ -94,6 +105,10 @@ curl -i http://127.0.0.1:8000/api/v1/contacts \
 ```
 
 Os testes usam SQLite temporário para serem rápidos e determinísticos, sem serviços externos. A migração é também validada numa base limpa; para confirmar o comportamento específico de PostgreSQL, executar o Docker Compose e fazer um POST real. `alembic upgrade head --sql` gera SQL de PostgreSQL sem se ligar à base.
+
+## CI
+
+`.github/workflows/ci.yml` corre em cada `push` para `main` e em cada pull request: `ruff check`, `ruff format --check`, `pytest`, `compileall`, aplicação das migrações a uma base limpa (SQLite, no runner), e uma auditoria de dependências (`pip-audit`, informativa por agora — não falha o build). Não há ainda deployment automático; isso pertence a uma fase seguinte.
 
 ## Development, Test e Production
 
@@ -143,11 +158,37 @@ Esta fase (Production Readiness) prepara a aplicação, mas as seguintes áreas 
 - gestor de secrets (AWS Secrets Manager ou equivalente);
 - serviço de email para processar os contactos recebidos;
 - monitorização/observabilidade (métricas, tracing, alerting);
-- pipeline de CI/CD;
+- pipeline de deployment (CI/CD além de lint+testes);
 - ambiente de staging;
 - integração com o frontend real;
 - armazenamento partilhado do rate limiting (ver abaixo);
 - configuração de proxies de confiança (`trusted proxy`) para aceitar `X-Forwarded-For` de forma segura.
+
+### Implementado
+
+- API REST (`POST /api/v1/contacts`) com o contrato descrito acima;
+- persistência do contacto em PostgreSQL (SQLite apenas em testes), incluindo `status` e timestamps;
+- idempotência opcional via header `Idempotency-Key`;
+- validação de entrada (tipos, limites, campos desconhecidos, blank strings);
+- rate limiting (5/min por IP no `POST /api/v1/contacts`);
+- CORS explícito por `CORS_ORIGINS` (sem wildcard, HTTPS obrigatório em produção);
+- tratamento de erros consistente (422/429/413/403/503/500) sem detalhes internos;
+- health/readiness (`/api/v1/health`, `/api/v1/ready`);
+- Docker multi-stage, não-root, com healthcheck; migrações como passo separado no Compose;
+- migrações Alembic (tabela `contacts`, incluindo a constraint de `status` e `idempotency_key`);
+- testes automatizados (unitários, integração, segurança) e CI (lint, format, testes, compileall, migração, audit de dependências).
+
+### Ainda não implementado
+
+- envio real de email/notificação da equipa Med Robots quando chega um contacto;
+- painel administrativo ou endpoints para consultar/gerir contactos e o seu `status`;
+- alojamento de produção (infraestrutura, PostgreSQL gerido, secrets manager);
+- monitorização/observabilidade e ambiente de staging;
+- deployment automático (CD);
+- integração real com o frontend `paulositecopy` (este é o próximo passo, fora desta fase);
+- armazenamento partilhado do rate limiting para múltiplas instâncias.
+
+Esta secção não deve ser lida como "production ready" — ver "Production" e "Segurança e próximos passos" abaixo para os requisitos e limitações concretas antes de qualquer publicação real.
 
 ## Health
 
@@ -161,5 +202,21 @@ A API limita o corpo do pedido a 16 KiB durante a leitura, valida tipos e compri
 Erros de base de dados são registados apenas pelo tipo de exceção (nunca pela mensagem, que pode conter parâmetros com dados pessoais); erros inesperados são registados com traceback completo nos logs internos (nunca devolvidos ao cliente), correlacionados pelo `request_id`.
 
 O `POST /api/v1/contacts` aceita até 5 pedidos por minuto por endereço remoto. O `slowapi` usa armazenamento em memória local ao processo: vários workers ou instâncias terão contadores independentes — esta é uma limitação conhecida desta fase. Antes de um deployment multi-instância, configurar armazenamento partilhado (ex.: Redis) ou um limite no gateway; isso pertence a uma fase seguinte. A aplicação usa `request.client.host`; cabeçalhos de proxy só devem alterar esse endereço após configurar proxies de confiança no servidor ASGI.
+
+### Estado do contacto e notificação futura
+
+O campo `status` começa sempre em `new` e é restringido por uma constraint da base de dados aos valores `new`, `in_progress` e `resolved`; não existem ainda endpoints para consultar contactos ou alterar o `status` (nenhum CRM foi construído nesta fase). O fluxo atual termina em `database`:
+
+```text
+POST /contacts → validação → database (status=new)
+```
+
+O envio real de email/notificação para a equipa Med Robots **não está implementado**; não deve ser assumido nem simulado. A arquitetura já está preparada para um passo seguinte, sem alterações estruturais:
+
+```text
+POST /contacts → validação → database → (fase futura) notification/email worker
+```
+
+Esse worker poderia, por exemplo, correr como um processo separado que lê contactos com `status=new` (ou consumir um evento), enviar o email e transitar o `status` para `in_progress`/`resolved` — mas essa decisão de design pertence à fase em que o email for efetivamente implementado.
 
 Antes da produção: configurar credenciais e origins reais, alojar PostgreSQL com backups, estabelecer política de retenção e proteção contra abuso, integrar o frontend, definir o processamento dos contactos e um serviço de email, e configurar observabilidade e deployment. Estas etapas não fazem parte desta fase.

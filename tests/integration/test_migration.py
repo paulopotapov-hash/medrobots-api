@@ -20,6 +20,7 @@ def test_initial_migration_applies_to_clean_database(tmp_path, monkeypatch) -> N
         "address",
         "message",
         "status",
+        "idempotency_key",
         "created_at",
         "updated_at",
     }
